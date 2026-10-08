@@ -1,0 +1,42 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": false,
+  "share": "disabled",
+  "model": "harness/harness-agent",
+  "default_agent": "harness",
+  "compaction": { "auto": false },
+  "provider": {
+    "harness": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Workshop harness",
+      "options": { "baseURL": "http://harness:8080/v1", "chunkTimeout": 600000 },
+      "models": { "harness-agent": { "name": "Harness agent" } }
+    }
+  },
+  "agent": {
+    "harness": {
+      "description": "The harness you are building",
+      "mode": "primary",
+      "model": "harness/harness-agent",
+      "prompt": "The harness replaces this prompt with its own.",
+      "permission": { "*": "deny" }
+    },
+    "title": { "disable": true },
+    "build": { "disable": true },
+    "plan": { "disable": true },
+    "general": { "disable": true },
+    "explore": { "disable": true }
+  },
+  "command": {
+    "investigate": {
+      "description": "The workshop task: find the invalid payment",
+      "agent": "harness",
+      "template": "There is a payments topic on this Kafka cluster. Exactly one payment is invalid.\nTell me its order_id and what is wrong with it."
+    },
+    "insert": {
+      "description": "Guardrails exercise: ask the agent to write to Kafka",
+      "agent": "harness",
+      "template": "Call execute_sql with exactly this sql: INSERT INTO payments(_key, amount) VALUES ('ord_z9', 1)"
+    }
+  }
+}

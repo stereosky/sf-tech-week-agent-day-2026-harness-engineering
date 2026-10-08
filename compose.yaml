@@ -1,0 +1,314 @@
+name: agent-harness
+
+# Let's Build an Agent Harness
+#
+#   cp .env.example .env        then set ACCEPT_EULA=true
+#   docker compose up -d --wait
+#   open http://localhost:8080/login   log the harness in to Lenses (once)
+#
+# OpenCode (chat)   http://localhost:4096
+# Lenses HQ         http://localhost:9991   admin / admin
+# Harness API       http://localhost:8080/v1
+# Kafka (host)      localhost:9092
+#
+# Based on the Lenses Community Edition compose (https://lenses.io/community-edition)
+# with pinned versions and sample data off. The MCP server stays in OAuth mode, as
+# CE ships it: the harness logs in with the read scope and acts for whoever logged
+# in. The workshop services are at the bottom. Every port is bound to 127.0.0.1
+# because HQ's login is admin / admin and conference Wi-Fi is shared.
+
+x-harness-image: &harness-image
+  build: ./harness
+  image: agent-harness/harness:dev
+
+services:
+  # ── Lenses Community Edition ──────────────────────────────────────────────
+
+  lenses-hq:
+    image: cr.lenses.io/lensesio/lenses-hq:6.2.8
+    command: /app/config.yaml
+    ports:
+      - 127.0.0.1:${HQ_PORT:-9991}:9991
+    depends_on:
+      postgres:
+        condition: service_healthy
+      create-configs:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "lenses-hq", "is-up", "lenses-hq:9991"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - lenses-hq-volume:/app
+
+  lenses-agent:
+    image: cr.lenses.io/lensesio/lenses-agent:6.2.8
+    environment:
+      # Demo only: lets the Agent register itself with HQ. Never give an Agent HQ credentials in production.
+      DEMO_HQ_URL: http://lenses-hq:9991
+      DEMO_HQ_USER: admin
+      DEMO_HQ_PASSWORD: admin
+      DEMO_AGENTKEY_PATH: /mnt/settings/DEMO_AGENTKEY
+      LENSES_HEAP_OPTS: -Xmx1536m -Xms512m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      lenses-hq:
+        condition: service_healthy
+      create-configs:
+        condition: service_completed_successfully
+    volumes:
+      - lenses-agent-volume:/mnt/settings
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: lenses
+      POSTGRES_PASSWORD: lenses
+    depends_on:
+      create-configs:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lenses"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres-volume:/docker-entrypoint-initdb.d
+
+  # Broker and Schema Registry in one image. From other containers: demo-kafka:19092.
+  demo-kafka:
+    image: lensesio/fast-data-dev:4.3.1
+    hostname: demo-kafka
+    environment:
+      ADV_HOST: demo-kafka
+      # A clean topic list, so list_topics shows the workshop topics and little else
+      SAMPLEDATA: 0
+      RUNNING_SAMPLEDATA: 0
+      RUNTESTS: 0
+      FORWARDLOGS: 0
+      CONNECT_PORT: 0
+      KAFKA_LISTENERS: PLAINTEXT://:9092,DOCKERCOMPOSE://:19092,CONTROLLER://:16062
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:${KAFKA_PORT:-9092},DOCKERCOMPOSE://demo-kafka:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >
+        DOCKERCOMPOSE:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,
+        SSL:SSL,SASL_PLAINTEXT:SASL_PLAINTEXT,SASL_SSL:SASL_SSL
+    ports:
+      - 127.0.0.1:${KAFKA_PORT:-9092}:9092
+
+  # Writes the HQ, Agent and Postgres config files, then exits.
+  create-configs:
+    image: busybox:1.37
+    command: >
+      sh -c '
+        printenv hq.config.yaml > /hq/config.yaml;
+        printenv agent.lenses.conf > /agent/lenses.conf;
+        printenv agent.provisioning.yaml > /agent/provisioning.yaml;
+        printenv postgres.init.sql > /postgres/init.sql
+      '
+    environment:
+      hq.config.yaml: |
+        http:
+          address: :9991
+          secureSessionCookies: false
+        auth:
+          administrators:
+            - admin
+          users:
+           - username: admin
+             # Password is admin
+             password: $$2a$$10$$DPQYpxj4Y2iTWeuF1n.ItewXnbYXh5/E9lQwDJ/cI/.gBboW2Hodm
+          oauth2:
+            authorizationServer:
+              enabled: true
+              # The address your browser uses. The harness reaches HQ as lenses-hq:9991
+              issuerURL: http://localhost:${HQ_PORT:-9991}
+              dcr: true
+              unauthenticatedIntrospection: true
+        agents:
+          address: :10000
+        database:
+          host: postgres:5432
+          username: lenses
+          password: lenses
+          database: hq
+        logger:
+          mode: text
+        license:
+          # Community licence key
+          key: license_key_2SFZ0BesCNu6NFv0-EOSIvY22ChSzNWXa5nSds2l4z3y7aBgRPKCVnaeMlS57hHNVboR2kKaQ8Mtv1LFt0MPBBACGhDT5If8PmTraUM5xXLz4MYv
+          # EULA at https://lenses.io/legals/eula
+          acceptEULA: ${ACCEPT_EULA:-false}
+      agent.lenses.conf: |
+        lenses.storage.postgres.host="postgres"
+        lenses.storage.postgres.port=5432
+        lenses.storage.postgres.database=agent
+        lenses.storage.postgres.username=lenses
+        lenses.storage.postgres.password=lenses
+        lenses.provisioning.path="/mnt/settings"
+        lenses.sql.state.dir="/data/lsql-state-dir"
+        lenses.secret.file="/data/security.conf"
+        lenses.storage.directory="/data/lenses"
+      agent.provisioning.yaml: |
+        lensesHq:
+          - configuration:
+              agentKey:
+                value: $${LENSESHQ_AGENT_KEY}
+              port:
+                value: 10000
+              server:
+                value: lenses-hq
+            name: lenses-hq
+            tags: ['hq']
+            version: 1
+        kafka:
+          - name: kafka
+            version: 1
+            tags: [ 'kafka', 'dev' ]
+            configuration:
+              metricsType:
+                value: JMX
+              metricsPort:
+                value: 9581
+              kafkaBootstrapServers:
+                value: [PLAINTEXT://demo-kafka:19092]
+              protocol:
+                value: PLAINTEXT
+        confluentSchemaRegistry:
+          - name: schema-registry
+            version: 1
+            tags: [ 'dev' ]
+            configuration:
+              schemaRegistryUrls:
+                value: [http://demo-kafka:8081]
+              metricsType:
+                value: JMX
+              metricsPort:
+                value: 9582
+      postgres.init.sql: |
+        CREATE DATABASE hq;
+        CREATE DATABASE agent;
+    volumes:
+      - lenses-hq-volume:/hq
+      - lenses-agent-volume:/agent
+      - postgres-volume:/postgres
+
+  # OAuth mode. The MCP server checks every token with HQ and passes it on, so each tool call
+  # runs as the person who logged in, within the scopes they granted. No shared key anywhere.
+  lenses-mcp:
+    image: cr.lenses.io/lensesio/mcp:6.2.2
+    environment:
+      TRANSPORT: http
+      OAUTH_ENABLED: "true"
+      LENSES_URL: http://lenses-hq:9991  # how the MCP server reaches HQ
+      LENSES_ADVERTISED_URL: http://localhost:${HQ_PORT:-9991}  # where clients send you to log in
+      MCP_ADVERTISED_URL: http://lenses-mcp:8000  # must match the URL the harness connects to
+    depends_on:
+      lenses-hq:
+        condition: service_healthy
+    # No host port: only the harness talks to it, on the compose network.
+
+  # ── The workshop ──────────────────────────────────────────────────────────
+
+  # Creates the payments and agent.session topics, produces five payments, then exits.
+  seed:
+    <<: *harness-image
+    command: ["python", "-m", "harness.seed"]
+    environment:
+      KAFKA_BOOTSTRAP: demo-kafka:19092
+    depends_on:
+      demo-kafka:
+        condition: service_started
+
+  # Model serving. On a Mac, run the Ollama app instead (see .env.example): Docker has no GPU there.
+  ollama:
+    image: ollama/ollama:0.34.4
+    profiles: [ollama]
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "8192"
+      OLLAMA_KEEP_ALIVE: "-1"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    # No host port: the harness reaches it on the compose network and a native Ollama may already use 11434.
+    volumes:
+      - ollama:/root/.ollama
+
+  ollama-pull:
+    image: ollama/ollama:0.34.4
+    profiles: [ollama]
+    command: ["pull", "${MODEL:-qwen3.5:2b}"]
+    environment:
+      OLLAMA_HOST: ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  # The thing you build. Edit ./harness/src on your machine and it reloads in here.
+  harness:
+    <<: *harness-image
+    environment:
+      MODEL: ${MODEL:-qwen3.5:2b}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      KAFKA_BOOTSTRAP: demo-kafka:19092
+      LENSES_MCP_URL: http://lenses-mcp:8000/mcp
+      LENSES_ENVIRONMENT: demo
+      LENSES_HQ_URL: http://lenses-hq:9991
+      HARNESS_URL: http://localhost:${HARNESS_PORT:-8080}
+      OAUTH_STATE_FILE: /state/lenses-oauth.json
+      WATCHFILES_FORCE_POLLING: ${WATCHFILES_FORCE_POLLING:-false}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 127.0.0.1:${HARNESS_PORT:-8080}:8080
+    volumes:
+      - ./harness/src:/app/src
+      - ./harness/tests:/app/tests
+      - ./harness/files:/app/files
+      - harness-state:/state  # your Lenses login, outside the source tree
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      lenses-mcp:
+        condition: service_started
+      ollama-pull:
+        condition: service_completed_successfully
+        required: false
+
+  # The chat window. OpenCode never talks to the model: its only provider is the harness.
+  opencode:
+    image: ghcr.io/anomalyco/opencode:1.18.33
+    command: ["web", "--hostname", "0.0.0.0", "--port", "4096"]
+    working_dir: /workspace
+    environment:
+      OPENCODE_CONFIG: /config/opencode.json
+      OPENCODE_DISABLE_CLAUDE_CODE: "1"
+      OPENCODE_DISABLE_AUTOUPDATE: "1"
+      OPENCODE_DISABLE_MODELS_FETCH: "1"
+    ports:
+      - 127.0.0.1:${OPENCODE_PORT:-4096}:4096
+    volumes:
+      - ./opencode/opencode.json:/config/opencode.json:ro
+      - ./workspace:/workspace
+      - opencode-data:/root/.local/share/opencode
+    depends_on:
+      harness:
+        condition: service_healthy
+
+volumes:
+  lenses-hq-volume:
+  lenses-agent-volume:
+  postgres-volume:
+  harness-state:
+  ollama:
+  opencode-data:
+
+networks:
+  default:
+    name: agent-harness
